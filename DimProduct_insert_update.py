@@ -1,14 +1,16 @@
+import boto3
+import psycopg2
 import os
 import pandas as pd
 from datetime import datetime
 from snowflake.connector import connect
 from airflow.decorators import task
 
-# Connect to S3
 @task(multiple_outputs=True)
-def connect_to_s3():
-    AWS_ACCESS_KEY = 'your_access_key'
-    AWS_SECRET_KEY = 'your_secret_key'
+def join_and_detect_new_or_changed_rows():
+    #### Connect to S3
+    AWS_ACCESS_KEY = 'YOUR_AWS_ACCESS_KEY'
+    AWS_SECRET_KEY = 'YOUR_AWS_SECRET_KEY'
 
     os.environ['AWS_ACCESS_KEY_ID'] = AWS_ACCESS_KEY
     os.environ['AWS_SECRET_ACCESS_KEY'] = AWS_SECRET_KEY
@@ -34,21 +36,17 @@ def connect_to_s3():
     # Apply average aggregation
     src_products = avg_agg(src_products, "category", "raw_price", "category_avg_price")
 
-    return {"src_products": src_products}
-
-
-# Connect to Snowflake DWH
-@task
-def connect_to_snowflake():
+    #### Connect to DWH
+        # Use your Snowflake user credentials to connect
     conn = connect(
-        user='your_user',
-        password='your_password',
-        account='your_account',
-        warehouse='your_warehouse',
-        database='your_database',
-        schema='your_schema',
-        role='your_role'
-    )
+            user='YOUR_SNOWFLAKE_USER',
+            password='YOUR_SNOWFLAKE_PASSWORD',
+            account='YOUR_SNOWFLAKE_ACCOUNT',
+            warehouse='YOUR_SNOWFLAKE_WAREHOUSE',
+            database= 'iti_airflow',
+            schema='DIMENSIONS',
+            role='YOUR_SNOWFLAKE_ROLE'
+        )
     print("Connected to Snowflake DWH successfully")
     cursor = conn.cursor()
 
@@ -57,24 +55,17 @@ def connect_to_snowflake():
 
     # Create the cursor object with your SQL command
     cursor.execute(sql_query)
-    print("Query executed")
-
-    # Convert output to a DataFrame
+    print("query executed")
+    # Convert output to a dataframe
     tgt_pro_df = cursor.fetch_pandas_all()
-    print("Data fetched")
+    print("data fetched")
     cursor.close()
-    print("Cursor closed")
+    print("cursor closed")
 
-    return {"tgt_pro_df": tgt_pro_df}
-
-
-# Process Data
-@task
-def process_data(src_products, tgt_pro_df):
-    # Columns renaming
-    src_products.columns = ["src_" + col for col in src_products.columns]
-    tgt_pro_df.columns = ["tgt_" + col.lower() for col in tgt_pro_df.columns]
-    print("Columns renamed")
+    # columns renaming
+    src_products.columns = ["src_"+col for col in src_products.columns]
+    tgt_pro_df.columns = ["tgt_"+col.lower() for col in tgt_pro_df.columns]
+    print("columns renamed")
 
     # Join source & target data and add effective dates and active flag
     src_plus_tgt = pd.merge(src_products, tgt_pro_df, how='left', left_on='src_id', right_on='tgt_id')
@@ -82,7 +73,7 @@ def process_data(src_products, tgt_pro_df):
     src_plus_tgt['effective_end_date'] = "2999-12-31"
     src_plus_tgt['active'] = True
 
-    # Get new rows only (i.e., rows that don't exist in DWH, all DWH data will be null)
+    # Get new rows only (i.e. rows that don't exist in DWH, all DWH data will be null)
     new_inserts = src_plus_tgt[src_plus_tgt.tgt_id.isna()].copy()
 
     # Select only source columns and the effective dates and active flag
@@ -94,7 +85,7 @@ def process_data(src_products, tgt_pro_df):
     new_rows_to_insert = str(result_tuple).lstrip('[').rstrip(']')
     print("Found {} new rows".format(len(result_list)))
 
-    # Get changed rows only (i.e., rows that exist in DWH but with different raw_price)
+    # Get changed rows only (i.e. rows that exist in DWH but with different raw_price)
     insert_updates = src_plus_tgt[(src_plus_tgt['src_raw_price'] != src_plus_tgt['tgt_raw_price']) & (~src_plus_tgt.tgt_id.isna())]
 
     # Convert result to string
@@ -102,7 +93,7 @@ def process_data(src_products, tgt_pro_df):
     insert_tuples = [tuple(row) for row in insert_list]
     changed_rows_to_insert = str(insert_tuples).lstrip('[').rstrip(']')
 
-    # The resulted string will be sent to the next task (SnowflakeOperator) to use in the insert query
+    # The resulted string will be sent to the next task (SnowflakeOperator) to use in insert query
     if changed_rows_to_insert == '':
         rows_to_insert = new_rows_to_insert
     else:
@@ -112,7 +103,7 @@ def process_data(src_products, tgt_pro_df):
     ids_to_update = insert_updates.src_id.tolist()
     print("Found {} changed rows".format(len(ids_to_update)))
 
-    # This result will be sent to the next task (SnowflakeOperator) to use in the update query
+    # This result will be sent to the next task (SnowflakeOperator) to use in update query
     ids_to_update = str(ids_to_update).lstrip('[').rstrip(']')
 
     return {"rows_to_insert": rows_to_insert, "ids_to_update": ids_to_update}
